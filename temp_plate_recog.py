@@ -8,15 +8,12 @@ import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
-import hyperlpr3 as lpr3
 from rapidocr_onnxruntime import RapidOCR
 
 PROVINCES = "京津沪渝冀豫云辽黑湘皖鲁新苏浙赣鄂桂甘晋蒙陕吉闽贵粤青藏川宁琼"
 PLATE_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ0123456789"
 
 _ocr_engine = None
-_lpr3_catcher = None
-_lock = threading.Lock()
 
 
 def draw_chinese_text(img, text, pos, font_size=20, color=(0, 255, 0)):
@@ -55,13 +52,6 @@ def _get_ocr():
     if _ocr_engine is None:
         _ocr_engine = RapidOCR()
     return _ocr_engine
-
-
-def _get_lpr3():
-    global _lpr3_catcher
-    if _lpr3_catcher is None:
-        _lpr3_catcher = lpr3.LicensePlateCatcher(detect_level=lpr3.DETECT_LEVEL_HIGH)
-    return _lpr3_catcher
 
 
 def _ocr(image):
@@ -213,33 +203,15 @@ def _recognize_frame(image):
     """Core recognition with tiered early-exit strategy.
     
     Returns:
-        tuple: (plate_text, confidence, plate_bbox)
-        bbox is (x, y, w, h) or None if not available
+        tuple: (plate_text, confidence, None)
     """
     all_texts = []
-    plate_bbox = None
-
-    try:
-        lpr3_results = _get_lpr3()(image)
-        if lpr3_results:
-            for plate_code, conf, plate_type, bbox in lpr3_results:
-                if bbox and len(bbox) >= 4:
-                    x1, y1, x2, y2 = map(int, bbox[:4])
-                    x, y = x1, y1
-                    w, h = x2 - x1, y2 - y1
-                    plate_bbox = (x, y, w, h)
-                    roi = image[max(0, y):y+h, max(0, x):x+w]
-                    if roi.size > 0:
-                        roi_texts = _ocr(roi)
-                        all_texts.extend(roi_texts)
-    except Exception:
-        pass
 
     texts = _ocr(image)
     all_texts.extend(texts)
     plate, score = _try_extract(all_texts)
     if plate and score >= 0.9:
-        return plate, score, plate_bbox
+        return plate, score, None
 
     for method in _FAST_METHODS:
         preprocessed = _preprocess(image, method)
@@ -247,7 +219,7 @@ def _recognize_frame(image):
         all_texts.extend(texts)
     plate, score = _try_extract(all_texts)
     if plate and score >= 0.85:
-        return plate, score, plate_bbox
+        return plate, score, None
 
     for method in _MID_METHODS:
         preprocessed = _preprocess(image, method)
@@ -255,7 +227,7 @@ def _recognize_frame(image):
         all_texts.extend(texts)
     plate, score = _try_extract(all_texts)
     if plate and score >= 0.7:
-        return plate, score, plate_bbox
+        return plate, score, None
 
     for method in _SLOW_METHODS:
         preprocessed = _preprocess(image, method)
@@ -263,26 +235,26 @@ def _recognize_frame(image):
         all_texts.extend(texts)
     plate, score = _try_extract(all_texts)
     if plate:
-        return plate, score, plate_bbox
+        return plate, score, None
 
     return None, 0.0, None
 
 
 def recognize_plate(image_input):
-    """识别临时车牌号。
+    """识别车牌号。
 
     Args:
         image_input: 图片文件路径(str) 或 OpenCV 图像 (numpy.ndarray)。
 
     Returns:
-        dict: {"plate": str|None, "confidence": float, "time_ms": float, "bbox": tuple|None}
+        dict: {"plate": str|None, "confidence": float, "time_ms": float}
     """
     t0 = time.perf_counter()
 
     if isinstance(image_input, str):
         image = cv2.imread(image_input)
         if image is None:
-            return {"plate": None, "confidence": 0.0, "time_ms": (time.perf_counter() - t0) * 1000, "bbox": None}
+            return {"plate": None, "confidence": 0.0, "time_ms": (time.perf_counter() - t0) * 1000}
     else:
         image = image_input
 
@@ -292,10 +264,10 @@ def recognize_plate(image_input):
         scale = max_dim / max(h, w)
         image = cv2.resize(image, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
 
-    plate, score, bbox = _recognize_frame(image)
+    plate, score, _ = _recognize_frame(image)
     elapsed = (time.perf_counter() - t0) * 1000
 
-    return {"plate": plate, "confidence": round(score, 2), "time_ms": round(elapsed, 1), "bbox": bbox}
+    return {"plate": plate, "confidence": round(score, 2), "time_ms": round(elapsed, 1)}
 
 
 def run_camera(camera_index=0):
@@ -320,7 +292,7 @@ def run_camera(camera_index=0):
     PROCESS_INTERVAL = 3
     processing = False
     result_lock = threading.Lock()
-    shared_result = {"plate": None, "confidence": 0.0, "time_ms": 0.0, "bbox": None}
+    shared_result = {"plate": None, "confidence": 0.0, "time_ms": 0.0}
 
     def _process_async(frame):
         nonlocal processing
@@ -330,7 +302,6 @@ def run_camera(camera_index=0):
                 shared_result["plate"] = result["plate"]
                 shared_result["confidence"] = result["confidence"]
                 shared_result["time_ms"] = result["time_ms"]
-                shared_result["bbox"] = result["bbox"]
         finally:
             processing = False
 
@@ -353,15 +324,9 @@ def run_camera(camera_index=0):
             last_plate = shared_result["plate"]
             last_conf = shared_result["confidence"]
             last_ms = shared_result["time_ms"]
-            last_bbox = shared_result["bbox"]
             if last_plate and last_plate != printed_plate and last_conf >= 0.8:
                 printed_plate = last_plate
                 print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {last_plate}  conf:{last_conf:.2f}  {last_ms:.0f}ms")
-
-        # Draw bounding box if available
-        if last_bbox:
-            x, y, w, h = last_bbox
-            cv2.rectangle(display, (x, y), (x + w, y + h), (0, 255, 0), 2)
 
         # Draw text with plate info
         if last_plate:
