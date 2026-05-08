@@ -1,0 +1,5 @@
+hyperlpr3
+rapidocr-onnxruntime
+opencv-python
+onnxruntime
+Pillow
